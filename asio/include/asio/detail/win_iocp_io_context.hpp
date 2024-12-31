@@ -224,6 +224,16 @@ private:
   typedef ULONG_PTR ulong_ptr_t;
 #endif // defined(WINVER) && (WINVER < 0x0500)
 
+#if defined(NTDDI_VERSION) && (NTDDI_VERSION >= NTDDI_WIN10_RS4)
+  typedef LONG(NTAPI* NtCreateWaitCompletionPacket_fn)(PHANDLE, ACCESS_MASK, PVOID);
+
+  typedef LONG(NTAPI* NtAssociateWaitCompletionPacket_fn)(
+      HANDLE WaitCompletionPacketHandle, HANDLE IoCompletionHandle,
+      HANDLE TargetObjectHandle, PVOID KeyContext,
+      PVOID ApcContext, LONG IoStatus,
+      ULONG_PTR IoStatusInformation, PBOOLEAN AlreadySignaled);
+#endif
+
   // Dequeues at most one operation from the I/O completion port, and then
   // executes it. Returns the number of operations that were dequeued (i.e.
   // either 0 or 1).
@@ -303,15 +313,12 @@ private:
   struct thread_function;
   friend struct thread_function;
 
-  // Function object for processing timeouts in a background thread.
-  struct timer_thread_function;
-  friend struct timer_thread_function;
-
-  // Background thread used for processing timeouts.
-  scoped_ptr<thread> timer_thread_;
-
   // A waitable timer object used for waiting for timeouts.
   auto_handle waitable_timer_;
+  auto_handle iocp_wait_handle_;
+
+  NtCreateWaitCompletionPacket_fn NtCreateWaitCompletionPacket_;
+  NtAssociateWaitCompletionPacket_fn NtAssociateWaitCompletionPacket_;
 
   // Non-zero if timers or completed operations need to be dispatched.
   long dispatch_required_;

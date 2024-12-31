@@ -58,25 +58,6 @@ struct win_iocp_io_context::work_finished_on_block_exit
   win_iocp_io_context* io_context_;
 };
 
-struct win_iocp_io_context::timer_thread_function
-{
-  void operator()()
-  {
-    while (::InterlockedExchangeAdd(&io_context_->shutdown_, 0) == 0)
-    {
-      if (::WaitForSingleObject(io_context_->waitable_timer_.handle,
-            INFINITE) == WAIT_OBJECT_0)
-      {
-        ::InterlockedExchange(&io_context_->dispatch_required_, 1);
-        ::PostQueuedCompletionStatus(io_context_->iocp_.handle,
-            0, wake_for_dispatch, 0);
-      }
-    }
-  }
-
-  win_iocp_io_context* io_context_;
-};
-
 win_iocp_io_context::win_iocp_io_context(
     asio::execution_context& ctx, int concurrency_hint, bool own_thread)
   : execution_context_service_base<win_iocp_io_context>(ctx),
@@ -101,6 +82,20 @@ win_iocp_io_context::win_iocp_io_context(
     asio::detail::throw_error(ec, "iocp");
   }
 
+  if (FARPROC nt_create_wait_completion_packet_ptr = ::GetProcAddress(
+          ::GetModuleHandleA("NTDLL"), "NtCreateWaitCompletionPacket")) {
+      NtCreateWaitCompletionPacket_ =
+          reinterpret_cast<NtCreateWaitCompletionPacket_fn>(
+              reinterpret_cast<void*>(nt_create_wait_completion_packet_ptr));
+  }
+
+  if (FARPROC nt_associate_wait_completion_packet_ptr = ::GetProcAddress(
+          ::GetModuleHandleA("NTDLL"), "NtAssociateWaitCompletionPacket")) {
+      NtAssociateWaitCompletionPacket_ =
+          reinterpret_cast<NtAssociateWaitCompletionPacket_fn>(
+              reinterpret_cast<void*>(nt_associate_wait_completion_packet_ptr));
+  }
+
   if (own_thread)
   {
     ::InterlockedIncrement(&outstanding_work_);
@@ -121,13 +116,6 @@ win_iocp_io_context::~win_iocp_io_context()
 void win_iocp_io_context::shutdown()
 {
   ::InterlockedExchange(&shutdown_, 1);
-
-  if (timer_thread_.get())
-  {
-    LARGE_INTEGER timeout;
-    timeout.QuadPart = 1;
-    ::SetWaitableTimer(waitable_timer_.handle, &timeout, 1, 0, 0, FALSE);
-  }
 
   if (thread_.get())
   {
@@ -164,12 +152,6 @@ void win_iocp_io_context::shutdown()
         static_cast<win_iocp_operation*>(overlapped)->destroy();
       }
     }
-  }
-
-  if (timer_thread_.get())
-  {
-    timer_thread_->join();
-    timer_thread_.reset();
   }
 }
 
@@ -498,6 +480,7 @@ size_t win_iocp_io_context::do_one(DWORD msec,
     {
       // We have been woken up to try to acquire responsibility for dispatching
       // timers and completed operations.
+      ::InterlockedExchange(&dispatch_required_, 1);
     }
     else
     {
@@ -553,9 +536,20 @@ void win_iocp_io_context::do_add_timer_queue(timer_queue_base& queue)
 
   timer_queues_.insert(&queue);
 
+  if (!iocp_wait_handle_.handle)
+  {
+      NtCreateWaitCompletionPacket_(&iocp_wait_handle_.handle, GENERIC_ALL, 0);
+      if (waitable_timer_.handle == 0) {
+          DWORD last_error = ::GetLastError();
+          asio::error_code ec(last_error, asio::error::get_system_category());
+          asio::detail::throw_error(ec, "timer");
+      }
+  }
+
   if (!waitable_timer_.handle)
   {
-    waitable_timer_.handle = ::CreateWaitableTimer(0, FALSE, 0);
+    waitable_timer_.handle = ::CreateWaitableTimerExW(
+          0, 0, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (waitable_timer_.handle == 0)
     {
       DWORD last_error = ::GetLastError();
@@ -567,14 +561,11 @@ void win_iocp_io_context::do_add_timer_queue(timer_queue_base& queue)
     LARGE_INTEGER timeout;
     timeout.QuadPart = -max_timeout_usec;
     timeout.QuadPart *= 10;
-    ::SetWaitableTimer(waitable_timer_.handle,
-        &timeout, max_timeout_msec, 0, 0, FALSE);
-  }
-
-  if (!timer_thread_.get())
-  {
-    timer_thread_function thread_function = { this };
-    timer_thread_.reset(new thread(thread_function, 65536));
+    ::SetWaitableTimerEx(waitable_timer_.handle,
+        &timeout, max_timeout_msec, 0, 0, 0,0);
+    NtAssociateWaitCompletionPacket_(iocp_wait_handle_.handle, iocp_.handle,
+                                     waitable_timer_.handle, (PVOID)wake_for_dispatch,
+                                     0, 0, 0, 0);
   }
 }
 
@@ -587,20 +578,20 @@ void win_iocp_io_context::do_remove_timer_queue(timer_queue_base& queue)
 
 void win_iocp_io_context::update_timeout()
 {
-  if (timer_thread_.get())
+  // There's no point updating the waitable timer if the new timeout period
+  // exceeds the maximum timeout. In that case, we might as well wait for the
+  // existing period of the timer to expire.
+  long timeout_usec = timer_queues_.wait_duration_usec(max_timeout_usec);
+  if (timeout_usec < max_timeout_usec)
   {
-    // There's no point updating the waitable timer if the new timeout period
-    // exceeds the maximum timeout. In that case, we might as well wait for the
-    // existing period of the timer to expire.
-    long timeout_usec = timer_queues_.wait_duration_usec(max_timeout_usec);
-    if (timeout_usec < max_timeout_usec)
-    {
       LARGE_INTEGER timeout;
       timeout.QuadPart = -timeout_usec;
       timeout.QuadPart *= 10;
-      ::SetWaitableTimer(waitable_timer_.handle,
-          &timeout, max_timeout_msec, 0, 0, FALSE);
-    }
+      ::SetWaitableTimerEx(waitable_timer_.handle,
+          &timeout, max_timeout_msec, 0, 0, 0, 0);
+      NtAssociateWaitCompletionPacket_(iocp_wait_handle_.handle, iocp_.handle,
+                                       waitable_timer_.handle,
+                                       (PVOID)wake_for_dispatch, 0, 0, 0, 0);
   }
 }
 
